@@ -1,0 +1,118 @@
+name: Android APK
+
+# Builds the Android app (apps/effectcraft-android) into an APK with cargo-apk and uploads it as a
+# workflow artifact. Run it from the Actions tab ("Run workflow"), or push a change under
+# apps/effectcraft-android. It needs no secrets: without a signing key it signs with a throwaway
+# debug key, which is fine for installing on your own phone (not for the Play Store).
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Build profile (release is much faster to run on a phone)"
+        type: choice
+        options: [release, debug]
+        default: release
+  push:
+    paths:
+      - "apps/effectcraft-android/**"
+      - ".github/workflows/android.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The pairing egui's own hello_android example documents for this egui fork.
+  ANDROID_PLATFORM: android-35
+  ANDROID_BUILD_TOOLS: 36.0.0
+  ANDROID_NDK_VERSION: 29.0.14206865
+  # cargo-apk with the fix for rust-mobile/cargo-subcommand#29 (same rev as the egui example's README).
+  CARGO_APK_REV: 282639508eeed7d73f2e1eaeea042da2716436d5
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      # Cheap and fast: the storage layout is plain Rust, so a bug there should fail before the
+      # long Android build starts. (No --locked: the new crate adds entries to Cargo.lock, which
+      # this run uploads for you to commit.)
+      - name: Test the portable code
+        run: cargo test -p effectcraft-android --lib
+
+      - name: Install the Android SDK and NDK
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" --install "platforms;$ANDROID_PLATFORM" "build-tools;$ANDROID_BUILD_TOOLS" "ndk;$ANDROID_NDK_VERSION"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Install cargo-apk
+        run: cargo install --git https://github.com/parasyte/cargo-apk.git --rev "$CARGO_APK_REV" cargo-apk
+
+      - name: Generate the launcher icons
+        run: sh apps/effectcraft-android/prepare-res.sh
+
+      # Release builds need a signing key. Use the repository secrets when they exist, else a
+      # throwaway key made here (installable on your own phone; Android shows "unknown developer").
+      - name: Prepare the signing key
+        if: ${{ (inputs.profile || 'release') == 'release' }}
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          KEYSTORE="$RUNNER_TEMP/release.keystore"
+          if [ -n "${KEYSTORE_BASE64:-}" ] && [ -n "${KEYSTORE_PASSWORD:-}" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$KEYSTORE"
+            PASS="$KEYSTORE_PASSWORD"
+          else
+            PASS="android"
+            keytool -genkeypair -keystore "$KEYSTORE" -storepass "$PASS" -keypass "$PASS" \
+              -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+          echo "::add-mask::$PASS"
+          echo "CARGO_APK_RELEASE_KEYSTORE=$KEYSTORE" >> "$GITHUB_ENV"
+          echo "CARGO_APK_RELEASE_KEYSTORE_PASSWORD=$PASS" >> "$GITHUB_ENV"
+
+      - name: Build the APK
+        env:
+          PROFILE: ${{ inputs.profile || 'release' }}
+        run: |
+          FLAG=""
+          if [ "$PROFILE" = "release" ]; then FLAG="--release"; fi
+          cargo apk build $FLAG -p effectcraft-android --lib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: effectcraft-mobile-apk
+          path: target/*/apk/*.apk
+          if-no-files-found: error
+
+      # The new crate's dependencies change Cargo.lock; commit this file to keep builds reproducible.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cargo-lock
+          path: Cargo.lock
